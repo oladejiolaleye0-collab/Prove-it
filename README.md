@@ -183,7 +183,9 @@ A command is a string or a list of arguments. `false` disables that check.
 
 ## Status
 
-v1. Tests run on Linux, macOS and Windows with Python 3.8 to 3.13 (see the badge above). It has not yet been tested inside long real sessions of Claude Code or Codex, so expect rough edges in the protocol wording. Issues and pull requests are welcome.
+v1. Tests run on Linux, macOS and Windows with Python 3.8 to 3.13 (see the badge above).
+
+The hook has been confirmed in a live Claude Code session (desktop app, Windows): it recorded the turn start, blocked the first "done", and Claude then ran Prove it from the block message alone (the skill was not installed) and reported the PARTIAL result honestly. That is one short session, not long real-world use, so expect rough edges in the protocol wording. It has not been tried with Codex. Issues and pull requests are welcome.
 
 Planned: deeper claim checks (callers, deletions), more ecosystems, and optional long-term history in an external memory tool.
 
