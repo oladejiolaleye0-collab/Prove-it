@@ -1,5 +1,7 @@
 # Prove it
 
+[![tests](https://github.com/oladejiolaleye0-collab/Prove-it/actions/workflows/test.yml/badge.svg)](https://github.com/oladejiolaleye0-collab/Prove-it/actions/workflows/test.yml)
+
 **Prove it** is an agent skill that blocks unverified "done" claims: it runs your tests and checks, compares each claim against the actual git diff and command output, and reports what was verified and what wasn't.
 
 Coding agents often say "fixed, all tests pass" without running anything, or claim they changed a file they never touched. Prove it gives the agent a script that produces real evidence, and a protocol that makes the agent report only what that evidence supports.
@@ -8,7 +10,7 @@ Coding agents often say "fixed, all tests pass" without running anything, or cla
 
 1. The agent lists the claims it is about to make in `.prove-it/claims.json`.
 2. `scripts/prove_it.py` auto-detects and runs your project's test, build and lint commands.
-3. Each claim is checked: files against the git diff, symbols against the lines added in the diff, and `tests_pass` / `build_ok` / `lint_ok` against the real exit codes.
+3. Each claim is checked: files against the git diff, symbols against the lines added in the diff, `tests_pass` / `build_ok` / `lint_ok` against the real exit codes, and an optional per-claim `command` (such as one targeted test) against its exit code.
 4. The report ends with an explicit **NOT VERIFIED** list, including files that changed but that no claim mentioned.
 5. Every run is appended to a local log, and `--history` shows how often claims held up.
 
@@ -32,7 +34,7 @@ CLAIMS
 [SUPPORTED] All tests pass
     - supported: python3 -m unittest -q exited 0
 [UNVERIFIED] Handles negative prices correctly
-    - unverified: nothing checkable: add 'files', 'symbols' or a 'kind' such as tests_pass
+    - unverified: nothing checkable: add 'files', 'symbols', 'command' or a 'kind' such as tests_pass
 
 NOT VERIFIED
   - claim not verified: Handles negative prices correctly (nothing checkable: ...)
@@ -57,35 +59,38 @@ git clone https://github.com/oladejiolaleye0-collab/Prove-it.git ~/.claude/skill
 
 Use `<your-project>/.claude/skills/prove-it` instead to install it for one project.
 
-To make Claude Code actually stop and verify, also add the Stop hook below.
+To make Claude Code actually stop and verify, also add the hook below.
 
-**Claude Code Stop hook (hard enforcement)**
+**Claude Code hook (hard enforcement)**
 
-The skill alone relies on the agent choosing to follow it. The Stop hook blocks Claude from ending its turn with a "done" claim while there are uncommitted changes that no prove-it run covers. Add this to `~/.claude/settings.json` (or `.claude/settings.json` in a project):
+The skill alone relies on the agent choosing to follow it. The hook blocks Claude from ending its turn with a "done" report unless a logged prove-it run backs it. Register the same script for two events in `~/.claude/settings.json` (or `.claude/settings.json` in a project):
 
 ```json
 {
   "hooks": {
+    "UserPromptSubmit": [
+      {"hooks": [{"type": "command", "command": "python3 ~/.claude/skills/prove-it/scripts/stop_hook.py"}]}
+    ],
     "Stop": [
-      {
-        "hooks": [
-          {"type": "command", "command": "python3 ~/.claude/skills/prove-it/scripts/stop_hook.py"}
-        ]
-      }
+      {"hooks": [{"type": "command", "command": "python3 ~/.claude/skills/prove-it/scripts/stop_hook.py"}]}
     ]
   }
 }
 ```
 
-On Windows, use `python` instead of `python3` and the full path to `stop_hook.py`.
+On Windows, use `python` instead of `python3` and the full path to `stop_hook.py`. `UserPromptSubmit` records the commit at the start of each turn so that work committed during the turn is checked too. Without it, only uncommitted changes are checked.
 
-When Claude tries to stop, the hook lets it through if any of these hold:
+When Claude tries to stop, the hook lets it through if:
 
-- there are no uncommitted changes (or the folder is not a git repo)
-- the last message does not sound like a done claim (words such as done, fixed, works, passing)
-- the latest logged prove-it run matches the files on disk exactly, and if that run FAILED, the message says what failed
+- nothing changed: no uncommitted changes and no commits this turn (or the folder is not a git repo), or
+- the last message does not read like a report of finished work (words such as done, fixed, added, updated, all set, good to go), or
+- the latest logged prove-it run backs it:
+  - the run matches the current commit and files exactly (any later edit or commit makes it stale)
+  - if commits were made this turn, the run compared against the commit the turn started from (`--base <sha>`; the hook tells Claude which)
+  - the run had claims, and every changed file is listed in some claim's `files`
+  - if the run FAILED, the message says what failed; if it was PARTIAL, the message says what is not verified
 
-Otherwise it blocks, and Claude is told to run prove-it and report the result. Any edit after a run makes that run stale, because each logged run stores a fingerprint of the diff.
+Otherwise it blocks, and tells Claude the exact command to run.
 
 To stop a stuck loop, the hook blocks at most `max_blocks` times in a row (default 2). After that it lets Claude stop and tells you the work is unverified. Settings go in `.prove-it.json`:
 
@@ -96,7 +101,7 @@ To stop a stuck loop, the hook blocks at most `max_blocks` times in a row (defau
 | `mode` | Effect |
 |---|---|
 | `claims` | Check only when the last message sounds like a done claim (default) |
-| `always` | Check every stop while there are uncommitted changes |
+| `always` | Check every stop while there are changes, whatever the message says |
 | `off` | Disable the hook for this project |
 
 **Codex and other agents that read `AGENTS.md`**
@@ -118,6 +123,7 @@ python3 scripts/prove_it.py --claims claims.json
 ```json
 [
   {"claim": "Fixed the login redirect bug", "files": ["src/auth.py"], "symbols": ["redirect_after_login"]},
+  {"claim": "Negative prices are rejected", "files": ["shop.py"], "command": "python3 -m pytest tests/test_shop.py -k negative"},
   {"claim": "All tests pass", "kind": "tests_pass"}
 ]
 ```
@@ -128,6 +134,7 @@ python3 scripts/prove_it.py --claims claims.json
 | `files` | Files the agent says it changed | Present in the git diff, including new untracked files |
 | `symbols` | Names the agent says it added or changed | Whole-word match in lines added by the diff |
 | `kind` | `tests_pass`, `build_ok` or `lint_ok` | The matching command exited 0. Any other value is reported as unverified |
+| `command` | A command that demonstrates this claim, such as one targeted test (string or list) | It exits 0. Its output is shown if it fails |
 
 A claim is **SUPPORTED** only if every part is supported, **NOT SUPPORTED** if any part is contradicted, and **UNVERIFIED** otherwise.
 
@@ -162,10 +169,13 @@ Override or disable in `.prove-it.json` at the project root:
 
 A command is a string or a list of arguments. `false` disables that check.
 
+`--repo` can point at a subfolder of a git repository, for example one package in a monorepo. Paths in claims and in the report are then relative to that folder, and changes outside it are ignored.
+
 ## Limits you should know about
 
-- **It checks structure, not correctness.** A claim passes if the file changed and the symbol was added. It cannot tell whether the change is right. Passing tests only prove what those tests cover.
-- **Without the Stop hook, the agent can skip it.** The skill alone relies on the agent following the protocol. The hook enforces it in Claude Code only. It also checks only uncommitted changes, so work the agent has already committed is not covered. Claim words are matched with a simple word list, so it can miss a claim or flag a sentence that is not one. Other agents still rely on `AGENTS.md`.
+- **It checks structure, not correctness.** A `files` or `symbols` claim passes if the file changed and the name was added. It cannot tell whether the change is right. A per-claim `command` gets closer, but a passing test only proves what that test covers.
+- **Without the hook, the agent can skip it.** The skill alone relies on the agent following the protocol. The hook enforces it in Claude Code only; other agents still rely on `AGENTS.md`.
+- **The hook reads wording, not intent.** In `claims` mode a done report with none of the trigger words gets through. Use `mode: "always"` if that matters more than the extra blocks. It also cannot judge whether claims are meaningful, only that they cover every changed file and that failures and gaps are mentioned.
 - **It runs your project's own commands.** That is `npm run test`, `make test` and so on, plus anything in `.prove-it.json`. Only run it in repositories you trust.
 - **Some "passing" runs prove little.** For example `go test` exits 0 when a package has no test files. Prove it reports the exit code; read the output lines it shows.
 - **Output can contain secrets.** The report prints the tail of check output. The log stores only statuses and claim text, and `.prove-it/` ignores itself in git.
@@ -173,9 +183,7 @@ A command is a string or a list of arguments. `false` disables that check.
 
 ## Status
 
-v1. The script and tests run and pass (`python3 -m unittest discover -s tests`). It has not yet been tested inside long real sessions of Claude Code or Codex, so expect rough edges in the protocol wording. Issues and pull requests are welcome.
-
-The Stop hook is new and covered by unit tests, but has not yet been used in real sessions.
+v1. Tests run on Linux, macOS and Windows with Python 3.8 to 3.13 (see the badge above). It has not yet been tested inside long real sessions of Claude Code or Codex, so expect rough edges in the protocol wording. Issues and pull requests are welcome.
 
 Planned: deeper claim checks (callers, deletions), more ecosystems, and optional long-term history in an external memory tool.
 

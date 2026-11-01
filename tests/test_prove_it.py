@@ -215,6 +215,34 @@ class ClaimTests(Base):
         code, data = self.verdicts([{"claim": "tests pass", "kind": "tests_pass"}])
         self.assertEqual(data["claims"][0]["verdict"], "UNVERIFIED")
 
+    def test_claim_command_that_passes_supports_the_claim(self):
+        cmd = [sys.executable, "-c", "print('behaves')"]
+        code, data = self.verdicts([{"claim": "negative prices raise", "command": cmd}])
+        self.assertEqual(data["claims"][0]["verdict"], "SUPPORTED")
+        self.assertIn("exited 0", data["claims"][0]["details"][0][1])
+
+    def test_claim_command_that_fails_contradicts_the_claim(self):
+        cmd = [sys.executable, "-c", "import sys; print('AssertionError: -1 != 0'); sys.exit(1)"]
+        code, data = self.verdicts([{"claim": "negative prices raise", "command": cmd}])
+        self.assertEqual(data["claims"][0]["verdict"], "NOT_SUPPORTED")
+        self.assertIn("AssertionError", data["claims"][0]["output_tail"])
+        self.assertEqual(code, 1)
+
+    def test_claim_command_not_found_is_unverified(self):
+        code, data = self.verdicts([{"claim": "x", "command": "no-such-tool-xyz --check"}])
+        self.assertEqual(data["claims"][0]["verdict"], "UNVERIFIED")
+
+    def test_claim_command_combines_with_files(self):
+        self.write("app.py", "def old():\n    return 2\n")
+        cmd = [sys.executable, "-c", "import sys; sys.exit(2)"]
+        code, data = self.verdicts([{"claim": "x", "files": ["app.py"], "command": cmd}])
+        self.assertEqual(data["claims"][0]["verdict"], "NOT_SUPPORTED")
+
+    def test_claim_command_failure_output_is_in_text_report(self):
+        cmd = [sys.executable, "-c", "import sys; print('boom-line'); sys.exit(1)"]
+        code, text = run_main("--repo", str(self.repo), "--claims", self.claims([{"claim": "x", "command": cmd}]), "--no-log")
+        self.assertIn("    | boom-line", text)
+
     def test_unknown_kind_is_unverified_not_ignored(self):
         self.write("app.py", "def old():\n    return 2\n")
         code, data = self.verdicts([{"claim": "changed app, tests pass", "files": ["app.py"], "kind": "test_pass"}])
@@ -255,6 +283,34 @@ class ClaimTests(Base):
         code, _ = run_main("--repo", str(self.repo), "--base=-x", "--no-log")
         self.assertEqual(code, 2)
 
+    def test_repo_option_pointing_at_a_subfolder(self):
+        self.write("pkg/mod.py", "a = 1\n")
+        self.write("pkg/.prove-it.json", json.dumps({"test": False, "build": False, "lint": False}))
+        self.commit_all("add pkg")
+        self.write("pkg/mod.py", "a = 1\ndef helper():\n    pass\n")
+        self.write("pkg/new.py", "b = 2\n")
+        self.write("app.py", "def old():\n    return 2\n")  # outside the subfolder
+        sub = self.repo / "pkg"
+        claims = self.write("pkg/claims.json", json.dumps([
+            {"claim": "added helper", "files": ["mod.py"], "symbols": ["helper"]},
+            {"claim": "added new", "files": ["new.py"]},
+        ]))
+        code, data = run_json("--repo", str(sub), "--claims", str(claims), "--no-log")
+        self.assertEqual([c["verdict"] for c in data["claims"]], ["SUPPORTED", "SUPPORTED"])
+        self.assertEqual(sorted(data["diff"]["files"]), ["mod.py", "new.py"])
+        self.assertEqual(data["changed_but_not_claimed"], [])
+        changed, _ = prove_it.working_changes(sub, "HEAD", frozenset({"claims.json"}))
+        self.assertEqual(sorted(changed), ["mod.py", "new.py"])
+
+    def test_large_untracked_file_is_fingerprinted_by_size(self):
+        with mock.patch("prove_it.MAX_UNTRACKED_BYTES", 10):
+            self.write("big.dat", "a" * 50)
+            first = prove_it.working_changes(self.repo, "HEAD")[1]
+            with mock.patch("pathlib.Path.read_bytes", side_effect=AssertionError("read big file")):
+                self.assertEqual(prove_it.working_changes(self.repo, "HEAD")[1], first)
+            self.write("big.dat", "a" * 60)
+            self.assertNotEqual(prove_it.working_changes(self.repo, "HEAD")[1], first)
+
     def test_repo_with_no_commits(self):
         fresh = tempfile.TemporaryDirectory()
         self.addCleanup(fresh.cleanup)
@@ -280,7 +336,8 @@ class NoGitTests(Base):
 
 class InputTests(Base):
     def test_bad_claims_are_usage_errors(self):
-        for bad in ('"just a string"', '[{"files": ["a.py"]}]', '[{"claim": "x", "files": "a.py"}]', "not json"):
+        for bad in ('"just a string"', '[{"files": ["a.py"]}]', '[{"claim": "x", "files": "a.py"}]', "not json",
+                    '[{"claim": "x", "command": ""}]', '[{"claim": "x", "command": [1, 2]}]'):
             path = self.write("claims.json", bad)
             code, _ = run_main("--repo", str(self.repo), "--claims", str(path), "--no-log")
             self.assertEqual(code, 2, bad)

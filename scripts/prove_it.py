@@ -71,6 +71,7 @@ class ClaimResult:
     kind: str
     verdict: str  # SUPPORTED | NOT_SUPPORTED | UNVERIFIED
     details: list = field(default_factory=list)  # [[verdict, text], ...]
+    output_tail: str = ""  # output of the claim's own command when it did not pass
 
 
 # --------------------------------------------------------------------------
@@ -346,6 +347,23 @@ def _resolve_ref(repo: Path, base: str) -> tuple:
     return ref, ""
 
 
+def rev_sha(repo: Path, ref: str):
+    """Return the commit sha for ref, or None (no git, no commits, bad ref)."""
+    try:
+        result = _git(repo, "rev-parse", "--verify", "--quiet", ref + "^{commit}")
+    except OSError:
+        return None
+    return result.stdout.strip() or None if result.returncode == 0 else None
+
+
+def is_ancestor(repo: Path, older: str, newer: str) -> bool:
+    """True if commit older is newer or one of its ancestors."""
+    try:
+        return _git(repo, "merge-base", "--is-ancestor", older, newer).returncode == 0
+    except OSError:
+        return False
+
+
 def working_changes(repo: Path, base: str, ignore: frozenset = frozenset()):
     """Return (changed paths, fingerprint) against base, or None without git.
 
@@ -359,13 +377,13 @@ def working_changes(repo: Path, base: str, ignore: frozenset = frozenset()):
         return None
     if ref is None:
         return None
-    names = _git(repo, "diff", "--name-only", "--no-renames", ref)
+    names = _git(repo, "diff", "--relative", "--name-only", "--no-renames", ref)
     tracked = sorted(p for p in (_norm(n) for n in names.stdout.splitlines() if n) if p not in ignore)
     digest = hashlib.sha256()
     if tracked:
         patch = subprocess.run(
-            ["git", "diff", "--binary", "--no-renames", "--no-color", ref, "--"]
-            + [":(top,literal)" + path for path in tracked],
+            ["git", "diff", "--relative", "--binary", "--no-renames", "--no-color", ref, "--"]
+            + [":(literal)" + path for path in tracked],
             cwd=str(repo),
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
@@ -379,7 +397,12 @@ def working_changes(repo: Path, base: str, ignore: frozenset = frozenset()):
     for path in untracked:
         digest.update(b"\0untracked\0" + path.encode("utf-8") + b"\0")
         try:
-            digest.update((repo / path).read_bytes())
+            stat = (repo / path).stat()
+            if stat.st_size > MAX_UNTRACKED_BYTES:
+                # Big files: size and mtime instead of reading every byte.
+                digest.update(f"{stat.st_size}:{stat.st_mtime_ns}".encode())
+            else:
+                digest.update((repo / path).read_bytes())
         except OSError:
             digest.update(b"<unreadable>")
     return tracked + untracked, digest.hexdigest()
@@ -391,13 +414,13 @@ def _collect_diff(repo: Path, base: str) -> DiffInfo:
         return DiffInfo(False, base, note=note)
 
     info = DiffInfo(True, base)
-    names = _git(repo, "diff", "--name-status", "--no-renames", ref)
+    names = _git(repo, "diff", "--relative", "--name-status", "--no-renames", ref)
     for line in names.stdout.splitlines():
         parts = line.split("\t")
         if len(parts) >= 2:
             info.files[_norm(parts[-1])] = parts[0][:1]
 
-    patch = _git(repo, "diff", "-U0", "--no-renames", "--no-color", ref)
+    patch = _git(repo, "diff", "--relative", "-U0", "--no-renames", "--no-color", ref)
     current = None
     in_hunk = False
     for line in patch.stdout.splitlines():
@@ -459,6 +482,8 @@ def load_claims(source: str) -> list:
                 raise UsageError(f"claim #{index}: '{key}' must be a list of strings")
         if not isinstance(item.get("kind", ""), str):
             raise UsageError(f"claim #{index}: 'kind' must be a string")
+        if "command" in item and _to_argv(item["command"]) is None:
+            raise UsageError(f"claim #{index}: 'command' must be a non-empty string or list of strings")
         claims.append(item)
     return claims
 
@@ -468,23 +493,31 @@ def _symbol_in(symbol: str, lines: list) -> bool:
     return any(pattern.search(line) for line in lines)
 
 
-def evaluate_claim(claim: dict, checks: dict, diff: DiffInfo) -> ClaimResult:
+def _command_part(result: CheckResult, label: str) -> list:
+    if result.status in ("NOT_CONFIGURED", "NOT_RUN"):
+        return ["UNVERIFIED", f"{label} did not run: {result.note or result.status}"]
+    if result.status == "PASS":
+        return ["SUPPORTED", f"{result.command} exited 0"]
+    detail = f"exit {result.exit_code}" if result.exit_code is not None else result.status.lower()
+    return ["NOT_SUPPORTED", f"{result.command} did not pass ({detail})"]
+
+
+def evaluate_claim(claim: dict, checks: dict, diff: DiffInfo,
+                   command_result: CheckResult | None = None) -> ClaimResult:
     parts: list = []
     kind = claim.get("kind") or ""
     files = [_norm(f) for f in claim.get("files", [])]
+
+    if command_result is not None:
+        parts.append(_command_part(command_result, "claim command"))
 
     if kind in CHECK_KINDS:
         check_kind = CHECK_KINDS[kind]
         result = checks.get(check_kind)
         if result is None:
             parts.append(["UNVERIFIED", f"{check_kind} check was not run (excluded by --checks)"])
-        elif result.status in ("NOT_CONFIGURED", "NOT_RUN"):
-            parts.append(["UNVERIFIED", f"{check_kind} check did not run: {result.note or result.status}"])
-        elif result.status == "PASS":
-            parts.append(["SUPPORTED", f"{result.command} exited 0"])
         else:
-            detail = f"exit {result.exit_code}" if result.exit_code is not None else result.status.lower()
-            parts.append(["NOT_SUPPORTED", f"{result.command} did not pass ({detail})"])
+            parts.append(_command_part(result, f"{check_kind} check"))
     elif kind:
         known = ", ".join(CHECK_KINDS)
         parts.append(["UNVERIFIED", f"unknown kind '{kind}' was not checked (use one of: {known})"])
@@ -510,7 +543,7 @@ def evaluate_claim(claim: dict, checks: dict, diff: DiffInfo) -> ClaimResult:
             parts.append(["NOT_SUPPORTED", f"'{symbol}' is not in any line added in {where}"])
 
     if not parts:
-        parts.append(["UNVERIFIED", "nothing checkable: add 'files', 'symbols' or a 'kind' such as tests_pass"])
+        parts.append(["UNVERIFIED", "nothing checkable: add 'files', 'symbols', 'command' or a 'kind' such as tests_pass"])
 
     verdicts = {p[0] for p in parts}
     if "NOT_SUPPORTED" in verdicts:
@@ -519,7 +552,10 @@ def evaluate_claim(claim: dict, checks: dict, diff: DiffInfo) -> ClaimResult:
         verdict = "UNVERIFIED"
     else:
         verdict = "SUPPORTED"
-    return ClaimResult(claim["claim"].strip(), kind, verdict, parts)
+    tail = ""
+    if command_result is not None and command_result.status != "PASS":
+        tail = command_result.output_tail
+    return ClaimResult(claim["claim"].strip(), kind, verdict, parts, tail)
 
 
 # --------------------------------------------------------------------------
@@ -587,6 +623,7 @@ def render_report(repo: Path, diff: DiffInfo, checks: list, claim_results: list,
         out.append(f"[{result.verdict.replace('_', ' ')}] {result.claim}")
         for verdict, text in result.details:
             out.append(f"    - {verdict.replace('_', ' ').lower()}: {text}")
+        out.extend(f"    | {line}" for line in result.output_tail.splitlines())
 
     out += ["", "NOT VERIFIED"]
     for gap in gaps:
@@ -608,13 +645,12 @@ def render_report(repo: Path, diff: DiffInfo, checks: list, claim_results: list,
 
 
 def append_log(repo: Path, state: str, base: str, checks: list, claim_results: list,
-               fingerprint: str | None = None, ignore: frozenset = frozenset()) -> None:
+               **extra) -> None:
     entry = {
         "ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "state": state,
         "base": base,
-        "fingerprint": fingerprint,
-        "ignore": sorted(ignore),
+        **extra,
         "checks": [{"kind": c.kind, "status": c.status, "exit_code": c.exit_code} for c in checks],
         "claims": [{"claim": r.claim, "kind": r.kind, "verdict": r.verdict} for r in claim_results],
     }
@@ -723,7 +759,12 @@ def _run(args: argparse.Namespace) -> int:
             )
 
     by_kind = {check.kind: check for check in checks}
-    claim_results = [evaluate_claim(claim, by_kind, diff) for claim in claims]
+    claim_results = []
+    for claim in claims:
+        command_result = None
+        if "command" in claim:
+            command_result = run_check("claim", _to_argv(claim["command"]), repo, args.timeout)
+        claim_results.append(evaluate_claim(claim, by_kind, diff, command_result))
     state, failures, gaps, unclaimed = summarize(checks, claim_results, diff, claims, args.strict)
 
     if args.json:
@@ -743,11 +784,18 @@ def _run(args: argparse.Namespace) -> int:
         print(render_report(repo, diff, checks, claim_results, state, failures, gaps, unclaimed))
 
     if not args.no_log:
-        # Fingerprint after the checks, so files they generate do not make the
-        # run look stale to the Stop hook.
-        changes = working_changes(repo, args.base, frozenset(ignore))
-        fingerprint = changes[1] if changes else None
-        append_log(repo, state, args.base, checks, claim_results, fingerprint, frozenset(ignore))
+        # Snapshot after the checks, so files they generate do not make the
+        # run look stale to the Stop hook. The snapshot is HEAD plus a
+        # fingerprint of everything uncommitted.
+        snapshot = working_changes(repo, "HEAD", frozenset(ignore))
+        append_log(
+            repo, state, args.base, checks, claim_results,
+            head=rev_sha(repo, "HEAD"),
+            fingerprint=snapshot[1] if snapshot else None,
+            base_sha=rev_sha(repo, args.base),
+            ignore=sorted(ignore),
+            unclaimed=unclaimed,
+        )
     return 1 if state == "FAILED" else 0
 
 
