@@ -89,7 +89,7 @@ Use `<your-project>/.claude/skills/prove-it` instead to install it for one proje
 
 **Claude Code: the hook (enforcement)**
 
-The skill alone relies on the agent choosing to follow it. The hook enforces it. Register the same script for three events in `~/.claude/settings.json` (or `.claude/settings.json` in a project):
+The skill alone relies on the agent choosing to follow it. The hook enforces it. Register the same script for four events in `~/.claude/settings.json` (or `.claude/settings.json` in a project):
 
 ```json
 {
@@ -98,6 +98,10 @@ The skill alone relies on the agent choosing to follow it. The hook enforces it.
       {"hooks": [{"type": "command", "command": "python3 ~/.claude/skills/prove-it/scripts/stop_hook.py"}]}
     ],
     "PreToolUse": [
+      {"matcher": "Edit|Write|MultiEdit|NotebookEdit|Bash",
+       "hooks": [{"type": "command", "command": "python3 ~/.claude/skills/prove-it/scripts/stop_hook.py"}]}
+    ],
+    "PostToolUse": [
       {"matcher": "Edit|Write|MultiEdit|NotebookEdit|Bash",
        "hooks": [{"type": "command", "command": "python3 ~/.claude/skills/prove-it/scripts/stop_hook.py"}]}
     ],
@@ -110,7 +114,7 @@ The skill alone relies on the agent choosing to follow it. The hook enforces it.
 
 On Windows, use `python` and the full path to `stop_hook.py`. What each event does:
 
-- **UserPromptSubmit**: records the commit at the start of the turn, unlocks the contract for the new turn, and reminds the agent of the protocol (so it works even where the skill is not installed).
+- **UserPromptSubmit**: records the commit and the files already changed at the start of the turn, unlocks the contract for the new turn, and reminds the agent of the protocol (so it works even where the skill is not installed).
 - **PreToolUse**: denies, with a reason the agent can act on:
   - edits before a contract exists (when `contract` is `required`)
   - edits outside the contract's scope and amendments
@@ -119,7 +123,9 @@ On Windows, use `python` and the full path to `stop_hook.py`. What each event do
   - edits to `.prove-it.json`, `.prove-it/log.jsonl`, `.prove-it/hook_state.json` and `.claude/settings*.json`, including through shell commands
 - **Stop**: blocks the end of the turn unless the latest logged run matches the current commit, files and contract; covers commits made this turn (`--base`, which the hook names); and the message admits any FAILED or PARTIAL result. Work done under a contract is always checked; otherwise only messages that read like a report of finished work are.
 
-Shell commands can still change files the edit guard does not see. Those changes are caught at the end: the verifier checks every changed file against the scope, whatever made the change.
+- **PostToolUse**: after every edit and shell command, looks at the files that actually changed this turn, whatever changed them (`sed -i`, redirects, scripts). Changes made before a contract exists, changes outside the scope, and a contract weakened after work started are reported straight back to the agent to fix. The contract is locked as soon as the first change lands. Files that were already changed when the turn started are not blamed on the agent.
+
+PreToolUse can stop an Edit or Write before it happens; for shell commands, PostToolUse catches the change right after, and the verifier checks every changed file against the scope again at the end.
 
 To stop a stuck loop, the Stop hook blocks at most `max_blocks` times in a row (default 2), then lets Claude stop and tells you the work is unverified. Settings go in `.prove-it.json`:
 
@@ -237,7 +243,7 @@ Detected automatically, first match wins per check: `.prove-it.json`, `package.j
 
 v2. Tests run on Linux, macOS and Windows with Python 3.8 to 3.13 (see the badge above).
 
-The v1 Stop hook was confirmed in a live Claude Code session (desktop app, Windows). The v2 contract guard and `fails_before` are covered by tests and a scripted end-to-end run, but have not yet been used in a live session. Expect rough edges in the protocol wording. It has not been tried with Codex. Issues and pull requests are welcome.
+Live Claude Code sessions (desktop app, Windows) confirmed the Stop hook, the turn-start reminder (the agent wrote a contract before editing), `fails_before` and an honest PARTIAL report. That session also showed the agent editing through `sed`, which bypassed the Edit-only guard; the PostToolUse check was added for that and is covered by tests, but not yet by a live session. Expect rough edges in the protocol wording. It has not been tried with Codex. Issues and pull requests are welcome.
 
 ## Development
 

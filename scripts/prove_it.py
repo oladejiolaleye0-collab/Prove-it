@@ -726,9 +726,12 @@ def check_contract(contract: dict, repo: Path, diff: DiffInfo, base: str, timeou
                 excused.append(f"{path}: {problem} (allowed: {allowed[path]})")
             else:
                 weakened.append(f"{path}: {problem}")
+    literal = [p for p in contract["scope"] if not any(ch in p for ch in "*?") and not p.endswith("/")]
+    unchanged = [p for p in literal if prove_contract.normalize(p) not in diff.files] if diff.available else []
     return {
         "task": contract["task"],
         "hash": prove_contract.contract_hash(contract),
+        "unchanged_scope": unchanged,
         "scope": prove_contract.scope_patterns(contract),
         "amendments": contract["amendments"],
         "out_of_scope": out_of_scope,
@@ -810,6 +813,8 @@ def render_report(repo: Path, diff: DiffInfo, checks: list, claim_results: list,
             out.append("[IN SCOPE] every changed file is within the contract's scope")
         for amendment in contract["amendments"]:
             out.append(f"    amended scope: {', '.join(amendment['scope'])} (reason: {amendment['reason']})")
+        if contract["unchanged_scope"]:
+            out.append("    in scope but unchanged: " + ", ".join(contract["unchanged_scope"]))
         if contract["tests_weakened"]:
             out.extend(f"[TEST WEAKENED] {item}" for item in contract["tests_weakened"])
         out += ["", "CRITERIA"]

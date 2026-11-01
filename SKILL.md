@@ -27,7 +27,8 @@ If one exists from an earlier task, replace it.
 ```
 
 - `task`: the user's request in one sentence. Do not narrow it to something easier.
-- `scope`: the files you expect to change. Globs work: `src/auth/**`, `docs/`. Keep it tight.
+- `scope`: the files you expect to change. Globs work: `src/auth/**`, `docs/`. Keep it tight:
+  listed files you never change are shown in the report as "in scope but unchanged".
 - `criteria`: what must be true when you are done, one entry per requirement in the user's request.
   - `command`: a command that proves the criterion. Prefer one targeted test.
   - `fails_before: true`: the test must fail on the code before your change and pass after it.
@@ -37,7 +38,8 @@ If one exists from an earlier task, replace it.
 
 ## 2. While working: stay on course
 
-- Only edit files in scope. If the task really needs another file, add an amendment and say why:
+- Only change files in scope, however you change them: edit tools, shell commands and scripts are all
+  checked against the scope. If the task really needs another file, add an amendment and say why:
   `"amendments": [{"scope": ["config/prices.py"], "reason": "the limit lives here"}]`.
   Amendments appear in the report; mention them to the user.
 - Do not drop or weaken criteria once you have started editing. If you cannot meet one, keep it

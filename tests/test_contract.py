@@ -442,6 +442,106 @@ class GuardTests(RepoBase):
         self.assertEqual(json.loads(out.getvalue())["hookSpecificOutput"]["permissionDecision"], "deny")
 
 
+class ShellEditTests(RepoBase):
+    """Edits made with sed, redirects or scripts never pass through the edit
+    guard, so PostToolUse checks the files themselves."""
+
+    def turn(self, session="s"):
+        stop_hook.record_turn_start({"cwd": str(self.repo), "session_id": session})
+
+    def after_bash(self, session="s", command="sed -i ..."):
+        return stop_hook.post_check({"hook_event_name": "PostToolUse", "cwd": str(self.repo),
+                                     "session_id": session, "tool_name": "Bash",
+                                     "tool_input": {"command": command}})
+
+    def assertFeedback(self, payload, words):
+        self.assertIsNotNone(payload)
+        self.assertEqual(payload["decision"], "block")
+        self.assertIn(words, payload["reason"])
+
+    def test_nothing_changed_is_quiet_and_does_not_lock(self):
+        self.turn()
+        self.set_contract(contract())
+        self.assertIsNone(self.after_bash(command="ls"))
+        self.assertEqual(stop_hook._read_state(self.repo)["locked"], {})
+
+    def test_shell_edit_without_contract_gets_feedback(self):
+        self.turn()
+        self.double_price()
+        self.assertFeedback(self.after_bash(), "without a contract")
+
+    def test_optional_mode_allows_shell_edit_without_contract(self):
+        self.write(".prove-it.json", json.dumps({"test": False, "build": False, "lint": False,
+                                                 "hook": {"contract": "optional"}}))
+        git(self.repo, "commit", "-qam", "optional")
+        self.turn()
+        self.double_price()
+        self.assertIsNone(self.after_bash())
+
+    def test_shell_edit_out_of_scope_gets_feedback(self):
+        self.turn()
+        self.set_contract(contract())
+        self.double_price()
+        self.write("other.py", "z = 2\n")
+        self.assertFeedback(self.after_bash(), "outside the contract's scope: other.py")
+
+    def test_amendment_clears_the_feedback(self):
+        self.turn()
+        self.set_contract(contract())
+        self.write("other.py", "z = 2\n")
+        self.assertIsNotNone(self.after_bash())
+        self.set_contract(contract(amendments=[{"scope": ["other.py"], "reason": "shared constant"}]))
+        self.assertIsNone(self.after_bash())
+
+    def test_files_dirty_before_the_turn_are_not_blamed(self):
+        self.write("other.py", "z = 2\n")  # the user's own work in progress
+        self.turn()
+        self.set_contract(contract())
+        self.double_price()
+        self.assertIsNone(self.after_bash())
+
+    def test_shell_edit_locks_the_contract(self):
+        self.turn()
+        self.set_contract(contract())
+        self.double_price()
+        self.assertIsNone(self.after_bash())
+        self.assertIn("s", stop_hook._read_state(self.repo)["locked"])
+        self.set_contract(contract(criteria=[{"id": "c9", "text": "easier"}]))  # rewritten with cat > ...
+        self.assertFeedback(self.after_bash(command="cat > .prove-it/contract.json"),
+                            "criterion 'c1' was removed")
+        self.assertIn("weakened after you started editing",
+                      stop_hook.decide({"cwd": str(self.repo), "session_id": "s",
+                                        "last_assistant_message": "Done."})["reason"])
+
+    def test_replacing_a_stale_contract_before_working_is_fine(self):
+        self.set_contract(contract(task="an earlier task", criteria=[{"id": "old", "text": "old"}]))
+        self.turn()
+        self.set_contract(contract())  # new task, nothing edited yet
+        self.assertIsNone(self.after_bash(command="cat > .prove-it/contract.json"))
+        self.double_price()
+        self.assertIsNone(self.after_bash())
+
+    def test_main_dispatches_post_tool_use(self):
+        self.turn()
+        self.double_price()
+        event = {"hook_event_name": "PostToolUse", "cwd": str(self.repo), "session_id": "s",
+                 "tool_name": "Bash", "tool_input": {"command": "sed -i x shop.py"}}
+        out = io.StringIO()
+        with mock.patch("sys.stdin", io.StringIO(json.dumps(event))), contextlib.redirect_stdout(out):
+            self.assertEqual(stop_hook.main(), 0)
+        self.assertEqual(json.loads(out.getvalue())["decision"], "block")
+
+    def test_report_lists_scope_entries_never_changed(self):
+        self.double_price()
+        self.set_contract(contract(scope=["shop.py", "test_shop.py", "other.py", "docs/"]))
+        code, data = self.run_json("--no-log")
+        self.assertEqual(data["contract"]["unchanged_scope"], ["other.py"])
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            prove_it.main(["--repo", str(self.repo), "--no-log"])
+        self.assertIn("in scope but unchanged: other.py", out.getvalue())
+
+
 class ContractStopTests(RepoBase):
     HONEST = "Done. c1 verified. Not verified: tests, build and lint checks are disabled."
 

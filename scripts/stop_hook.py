@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
 """Prove it hook for Claude Code.
 
-Register this one script for three events:
-  UserPromptSubmit  records HEAD when a turn starts (so commits made during
-                    the turn are caught) and reminds Claude of the protocol.
+Register this one script for four events:
+  UserPromptSubmit  records HEAD and what was already changed when a turn
+                    starts, and reminds Claude of the protocol.
   PreToolUse        keeps Claude on course: no edits before a contract, no
                     edits outside the contract's scope, no dropping criteria
                     mid-turn, no tampering with Prove it's own files.
+  PostToolUse       after edits and shell commands, checks the files that
+                    actually changed against the contract, so edits made with
+                    sed, redirects or scripts are held to the same rules.
   Stop              blocks Claude from ending its turn with a "done" report
                     unless a logged prove-it run backs it.
 
@@ -37,7 +40,7 @@ MODES = ("claims", "always", "off")
 CONTRACT_MODES = ("required", "optional", "off")
 DEFAULT_SETTINGS = {"mode": "claims", "max_blocks": 2, "contract": "required"}
 STATE_FILE = "hook_state.json"
-STATE_KEYS = ("turn_start", "blocks", "locked")
+STATE_KEYS = ("turn_start", "blocks", "locked", "start_fp", "dirty_start")
 MAX_SESSIONS_KEPT = 20
 EDIT_TOOLS = ("Edit", "Write", "MultiEdit", "NotebookEdit")
 # Files the agent must never change: they decide what gets checked.
@@ -208,6 +211,11 @@ def record_turn_start(event: dict):
     state = _read_state(repo)
     state["turn_start"].pop(session, None)  # re-insert so it counts as recent
     state["turn_start"][session] = prove_it.rev_sha(repo, "HEAD") or ""
+    # What was already changed before this turn, so it is not blamed on it.
+    snapshot = prove_it.working_changes(repo, "HEAD")
+    for key, value in (("start_fp", snapshot[1]), ("dirty_start", snapshot[0])):
+        state[key].pop(session, None)
+        state[key][session] = value
     state["blocks"].pop(session, None)
     state["locked"].pop(session, None)
     _write_state(repo, state)
@@ -318,6 +326,72 @@ def guard(event: dict):
         state["locked"][session] = contract
         _write_state(repo, state)
     return None
+
+
+# --------------------------------------------------------------------------
+# PostToolUse: catch changes made by any tool, including shell commands
+# --------------------------------------------------------------------------
+
+
+def post_check(event: dict):
+    """After a tool ran, compare what changed this turn with the contract.
+
+    The edit guard only sees Edit and Write. Shell commands (sed, redirects,
+    scripts) change files too, so this looks at the files themselves.
+    Returns a block payload whose reason is fed back to Claude, or None.
+    """
+    repo = Path(event.get("cwd") or ".").resolve()
+    if not repo.is_dir():
+        return None
+    settings = load_settings(repo)
+    if settings["mode"] == "off" or settings["contract"] == "off":
+        return None
+    if (event.get("tool_name") or "") not in EDIT_TOOLS + ("Bash",):
+        return None
+    snapshot = prove_it.working_changes(repo, "HEAD")
+    if snapshot is None:
+        return None
+    session = str(event.get("session_id") or "")
+    state = _read_state(repo)
+    start_fp = state["start_fp"].get(session)
+    if start_fp is not None and snapshot[1] == start_fp:
+        return None  # nothing changed yet this turn
+    before = set(state["dirty_start"].get(session) or [])
+    changed = [p for p in snapshot[0] if p not in before]
+
+    contract, error = _load_contract(repo)
+    if error:
+        return _feedback(f".prove-it/contract.json is not valid: {error}. Fix it now.")
+    if contract is None:
+        if settings["contract"] == "required" and changed:
+            return _feedback(
+                "you changed " + ", ".join(changed[:10]) + " without a contract. Write "
+                f".prove-it/contract.json now with the task, a scope covering these files and the "
+                f"acceptance criteria ({CONTRACT_EXAMPLE}), or undo the changes."
+            )
+        return None
+
+    locked = state["locked"].get(session)
+    if not locked:
+        state["locked"][session] = contract  # work has started: hold the agent to this
+        _write_state(repo, state)
+    else:
+        taken_back = prove_contract.dropped_since(locked, contract)
+        if taken_back:
+            return _feedback("the contract was weakened after work started: " + "; ".join(taken_back)
+                             + ". Restore it and report anything you cannot meet as not done.")
+    outside = [p for p in changed if not prove_contract.in_scope(p, contract)]
+    if outside:
+        return _feedback(
+            "these changes are outside the contract's scope: " + ", ".join(outside[:10]) + ". Undo "
+            "them now, or if they are really needed for the task, add them to the contract as "
+            '{"amendments": [{"scope": [...], "reason": "why"}]} and tell the user.'
+        )
+    return None
+
+
+def _feedback(reason: str) -> dict:
+    return {"decision": "block", "reason": f"Prove it: {reason}"}
 
 
 # --------------------------------------------------------------------------
@@ -435,10 +509,12 @@ def main() -> int:
             payload = record_turn_start(event)
         elif name == "PreToolUse":
             payload = guard(event)
+        elif name == "PostToolUse":
+            payload = post_check(event)
         else:
             payload = decide(event)
     except Exception as exc:  # a broken hook must not trap the session
-        if name == "PreToolUse":
+        if name in ("PreToolUse", "PostToolUse"):
             return 0
         payload = {"systemMessage": f"Prove it hook error, stop allowed: {exc}"}
     if payload:
