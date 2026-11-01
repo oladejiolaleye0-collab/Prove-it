@@ -10,6 +10,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -298,24 +299,70 @@ def collect_diff(repo: Path, base: str, ignore: frozenset = frozenset()) -> Diff
     return info
 
 
-def _collect_diff(repo: Path, base: str) -> DiffInfo:
+def _resolve_ref(repo: Path, base: str) -> tuple:
+    """Return (ref, note). ref is None when no diff is available."""
     try:
         inside = _git(repo, "rev-parse", "--is-inside-work-tree")
     except OSError:
-        return DiffInfo(False, base, note="git is not installed")
+        return None, "git is not installed"
     if inside.returncode != 0 or inside.stdout.strip() != "true":
-        return DiffInfo(False, base, note="not a git repository")
-
-    ref = base
+        return None, "not a git repository"
     resolved = _git(repo, "rev-parse", "--verify", "--quiet", base + "^{commit}")
-    if resolved.returncode != 0:
-        if base != "HEAD":
-            return DiffInfo(False, base, note=f"base '{base}' is not a valid commit")
-        # A repo with no commits yet: compare against the empty tree.
-        empty = _git(repo, "hash-object", "-t", "tree", "--stdin", input_text="")
-        ref = empty.stdout.strip()
-        if empty.returncode != 0 or not ref:
-            return DiffInfo(False, base, note="could not resolve an empty tree")
+    if resolved.returncode == 0:
+        return base, ""
+    if base != "HEAD":
+        return None, f"base '{base}' is not a valid commit"
+    # A repo with no commits yet: compare against the empty tree.
+    empty = _git(repo, "hash-object", "-t", "tree", "--stdin", input_text="")
+    ref = empty.stdout.strip()
+    if empty.returncode != 0 or not ref:
+        return None, "could not resolve an empty tree"
+    return ref, ""
+
+
+def working_changes(repo: Path, base: str, ignore: frozenset = frozenset()):
+    """Return (changed paths, fingerprint) against base, or None without git.
+
+    The fingerprint is a hash of the full patch plus untracked file contents,
+    so any edit after a run gives a different value. The Stop hook uses it to
+    tell whether the last logged run still matches the files on disk.
+    """
+    try:
+        ref, _ = _resolve_ref(repo, base)
+    except OSError:
+        return None
+    if ref is None:
+        return None
+    names = _git(repo, "diff", "--name-only", "--no-renames", ref)
+    tracked = sorted(p for p in (_norm(n) for n in names.stdout.splitlines() if n) if p not in ignore)
+    digest = hashlib.sha256()
+    if tracked:
+        patch = subprocess.run(
+            ["git", "diff", "--binary", "--no-renames", "--no-color", ref, "--"]
+            + [":(top,literal)" + path for path in tracked],
+            cwd=str(repo),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+        )
+        digest.update(patch.stdout)
+    others = _git(repo, "ls-files", "--others", "--exclude-standard")
+    untracked = sorted(
+        p for p in (_norm(n) for n in others.stdout.splitlines() if n)
+        if not p.startswith(LOG_DIR + "/") and p not in ignore
+    )
+    for path in untracked:
+        digest.update(b"\0untracked\0" + path.encode("utf-8") + b"\0")
+        try:
+            digest.update((repo / path).read_bytes())
+        except OSError:
+            digest.update(b"<unreadable>")
+    return tracked + untracked, digest.hexdigest()
+
+
+def _collect_diff(repo: Path, base: str) -> DiffInfo:
+    ref, note = _resolve_ref(repo, base)
+    if ref is None:
+        return DiffInfo(False, base, note=note)
 
     info = DiffInfo(True, base)
     names = _git(repo, "diff", "--name-status", "--no-renames", ref)
@@ -531,11 +578,14 @@ def render_report(repo: Path, diff: DiffInfo, checks: list, claim_results: list,
 # --------------------------------------------------------------------------
 
 
-def append_log(repo: Path, state: str, base: str, checks: list, claim_results: list) -> None:
+def append_log(repo: Path, state: str, base: str, checks: list, claim_results: list,
+               fingerprint: str | None = None, ignore: frozenset = frozenset()) -> None:
     entry = {
         "ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "state": state,
         "base": base,
+        "fingerprint": fingerprint,
+        "ignore": sorted(ignore),
         "checks": [{"kind": c.kind, "status": c.status, "exit_code": c.exit_code} for c in checks],
         "claims": [{"claim": r.claim, "kind": r.kind, "verdict": r.verdict} for r in claim_results],
     }
@@ -664,7 +714,11 @@ def _run(args: argparse.Namespace) -> int:
         print(render_report(repo, diff, checks, claim_results, state, failures, gaps, unclaimed))
 
     if not args.no_log:
-        append_log(repo, state, args.base, checks, claim_results)
+        # Fingerprint after the checks, so files they generate do not make the
+        # run look stale to the Stop hook.
+        changes = working_changes(repo, args.base, frozenset(ignore))
+        fingerprint = changes[1] if changes else None
+        append_log(repo, state, args.base, checks, claim_results, fingerprint, frozenset(ignore))
     return 1 if state == "FAILED" else 0
 
 

@@ -55,6 +55,48 @@ git clone https://github.com/oladejiolaleye0-collab/Prove-it.git ~/.claude/skill
 
 Use `<your-project>/.claude/skills/prove-it` instead to install it for one project.
 
+To make Claude Code actually stop and verify, also add the Stop hook below.
+
+**Claude Code Stop hook (hard enforcement)**
+
+The skill alone relies on the agent choosing to follow it. The Stop hook blocks Claude from ending its turn with a "done" claim while there are uncommitted changes that no prove-it run covers. Add this to `~/.claude/settings.json` (or `.claude/settings.json` in a project):
+
+```json
+{
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {"type": "command", "command": "python3 ~/.claude/skills/prove-it/scripts/stop_hook.py"}
+        ]
+      }
+    ]
+  }
+}
+```
+
+On Windows, use `python` instead of `python3` and the full path to `stop_hook.py`.
+
+When Claude tries to stop, the hook lets it through if any of these hold:
+
+- there are no uncommitted changes (or the folder is not a git repo)
+- the last message does not sound like a done claim (words such as done, fixed, works, passing)
+- the latest logged prove-it run matches the files on disk exactly, and if that run FAILED, the message says what failed
+
+Otherwise it blocks, and Claude is told to run prove-it and report the result. Any edit after a run makes that run stale, because each logged run stores a fingerprint of the diff.
+
+To stop a stuck loop, the hook blocks at most `max_blocks` times in a row (default 2). After that it lets Claude stop and tells you the work is unverified. Settings go in `.prove-it.json`:
+
+```json
+{"hook": {"mode": "claims", "max_blocks": 2}}
+```
+
+| `mode` | Effect |
+|---|---|
+| `claims` | Check only when the last message sounds like a done claim (default) |
+| `always` | Check every stop while there are uncommitted changes |
+| `off` | Disable the hook for this project |
+
 **Codex and other agents that read `AGENTS.md`**
 
 ```bash
@@ -121,7 +163,7 @@ A command is a string or a list of arguments. `false` disables that check.
 ## Limits you should know about
 
 - **It checks structure, not correctness.** A claim passes if the file changed and the symbol was added. It cannot tell whether the change is right. Passing tests only prove what those tests cover.
-- **The agent can skip it.** v1 is a skill plus a script, so it relies on the agent following the protocol. A hook that blocks "done" until evidence exists is planned.
+- **Without the Stop hook, the agent can skip it.** The skill alone relies on the agent following the protocol. The hook enforces it in Claude Code only. It also checks only uncommitted changes, so work the agent has already committed is not covered. Claim words are matched with a simple word list, so it can miss a claim or flag a sentence that is not one. Other agents still rely on `AGENTS.md`.
 - **It runs your project's own commands.** That is `npm run test`, `make test` and so on, plus anything in `.prove-it.json`. Only run it in repositories you trust.
 - **Some "passing" runs prove little.** For example `go test` exits 0 when a package has no test files. Prove it reports the exit code; read the output lines it shows.
 - **Output can contain secrets.** The report prints the tail of check output. The log stores only statuses and claim text, and `.prove-it/` ignores itself in git.
@@ -131,7 +173,9 @@ A command is a string or a list of arguments. `false` disables that check.
 
 v1. The script and tests run and pass (`python3 -m unittest discover -s tests`). It has not yet been tested inside long real sessions of Claude Code or Codex, so expect rough edges in the protocol wording. Issues and pull requests are welcome.
 
-Planned: a Claude Code Stop hook for hard enforcement, deeper claim checks (callers, deletions), more ecosystems, and optional long-term history in an external memory tool.
+The Stop hook is new and covered by unit tests, but has not yet been used in real sessions.
+
+Planned: deeper claim checks (callers, deletions), more ecosystems, and optional long-term history in an external memory tool.
 
 ## Development
 

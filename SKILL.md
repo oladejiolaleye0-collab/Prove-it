@@ -59,3 +59,5 @@ you have reported its result. Unverified "done" claims are the failure this skil
 - Do not claim more than the report supports. "Tests pass" means the exact command in the report exited 0.
 - A passing check is not proof the change is correct. Say what the checks do not cover when it matters.
 - If the script cannot run (no Python, no git), say that plainly and report the work as unverified.
+- If the Prove it Stop hook blocks you, do what it says: run the verifier on the current files and report the result.
+  Do not run with `--no-log`, because the hook only accepts logged runs. Any edit after a run means you must run it again.
