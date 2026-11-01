@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Prove it: run the project's real checks and match an agent's claims
-against the git diff. Standard library only (Python 3.8+).
+"""Prove it: run the project's real checks and match an agent's claims and
+contract against the git diff. Standard library only (Python 3.8+).
 
 Usage:
     python3 prove_it.py --claims claims.json
+    python3 prove_it.py              # checks .prove-it/contract.json if present
     python3 prove_it.py --history
 """
 
@@ -18,10 +19,14 @@ import shlex
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import prove_contract  # noqa: E402
 
 TAIL_LINES = 30
 PASS_TAIL_LINES = 3
@@ -32,6 +37,13 @@ CHECK_KINDS = {"tests_pass": "test", "build_ok": "build", "lint_ok": "lint"}
 NPM_DEFAULT_TEST = "no test specified"
 LOG_DIR = ".prove-it"
 LOG_FILE = "log.jsonl"
+DEFAULT_BEFORE_LINKS = ("node_modules", ".venv", "venv")
+# Failures that come from the environment, not from the code under test.
+ENV_FAILURE_RE = re.compile(
+    r"command not found|is not recognized as an internal or external command|"
+    r"Cannot find module|ERR_MODULE_NOT_FOUND",
+    re.IGNORECASE,
+)
 STATUS_NAMES = {
     "A": "added",
     "M": "modified",
@@ -62,6 +74,7 @@ class DiffInfo:
     base: str
     files: dict = field(default_factory=dict)  # path -> status letter
     added: dict = field(default_factory=dict)  # path -> list of added lines
+    removed: dict = field(default_factory=dict)  # path -> list of removed lines
     note: str = ""
 
 
@@ -72,6 +85,15 @@ class ClaimResult:
     verdict: str  # SUPPORTED | NOT_SUPPORTED | UNVERIFIED
     details: list = field(default_factory=list)  # [[verdict, text], ...]
     output_tail: str = ""  # output of the claim's own command when it did not pass
+
+
+@dataclass
+class CriterionResult:
+    id: str
+    text: str
+    verdict: str  # SUPPORTED | NOT_SUPPORTED | UNVERIFIED
+    details: list = field(default_factory=list)
+    output_tail: str = ""
 
 
 # --------------------------------------------------------------------------
@@ -323,6 +345,7 @@ def collect_diff(repo: Path, base: str, ignore: frozenset = frozenset()) -> Diff
     for path in ignore:
         info.files.pop(path, None)
         info.added.pop(path, None)
+        info.removed.pop(path, None)
     return info
 
 
@@ -421,14 +444,17 @@ def _collect_diff(repo: Path, base: str) -> DiffInfo:
             info.files[_norm(parts[-1])] = parts[0][:1]
 
     patch = _git(repo, "diff", "--relative", "-U0", "--no-renames", "--no-color", ref)
-    current = None
+    current = old = None
     in_hunk = False
     for line in patch.stdout.splitlines():
         if line.startswith("diff --git "):
             in_hunk = False
-            current = None
+            current = old = None
         elif line.startswith("@@"):
             in_hunk = True
+        elif not in_hunk and line.startswith("--- "):
+            source = line[4:].split("\t")[0]
+            old = _norm(source[2:]) if source.startswith("a/") else None
         elif not in_hunk and line.startswith("+++ "):
             target = line[4:].split("\t")[0]
             current = _norm(target[2:]) if target.startswith("b/") else None
@@ -436,6 +462,8 @@ def _collect_diff(repo: Path, base: str) -> DiffInfo:
                 info.added.setdefault(current, [])
         elif in_hunk and line.startswith("+") and current:
             info.added[current].append(line[1:])
+        elif in_hunk and line.startswith("-") and (current or old):
+            info.removed.setdefault(current or old, []).append(line[1:])
 
     others = _git(repo, "ls-files", "--others", "--exclude-standard")
     for rel in others.stdout.splitlines():
@@ -559,11 +587,172 @@ def evaluate_claim(claim: dict, checks: dict, diff: DiffInfo,
 
 
 # --------------------------------------------------------------------------
+# Contract: scope, criteria, fails-before, test integrity
+# --------------------------------------------------------------------------
+
+
+def load_config(repo: Path) -> dict:
+    config = _read_json(repo / ".prove-it.json")
+    return config if isinstance(config, dict) else {}
+
+
+def _link_dir(src: Path, dst: Path) -> None:
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        os.symlink(str(src), str(dst), target_is_directory=True)
+    except OSError:
+        if os.name != "nt":
+            raise
+        import _winapi  # junctions need no admin rights, unlike symlinks
+
+        _winapi.CreateJunction(str(src), str(dst))
+
+
+def _unlink_dir(link: Path) -> bool:
+    """Remove a symlink or junction without touching what it points to."""
+    try:
+        os.unlink(str(link))
+        return True
+    except OSError:
+        pass
+    try:
+        os.rmdir(str(link))  # a junction on Windows; never follows it
+        return True
+    except OSError:
+        return False
+
+
+def run_fails_before(repo: Path, base_sha: str, argv: list, carry: list,
+                     links: list, timeout: int) -> CheckResult:
+    """Run argv on the code at base_sha, with the current versions of the
+    carried test files copied in. A real regression test fails there."""
+    display = shlex.join(argv)
+    prefix = _git(repo, "rev-parse", "--show-prefix").stdout.strip()
+    tmp = Path(tempfile.mkdtemp(prefix="prove-it-before-"))
+    tree = tmp / "tree"
+    made: list = []
+    clean = True
+    try:
+        added = _git(repo, "worktree", "add", "--detach", "--quiet", str(tree), base_sha)
+        if added.returncode != 0:
+            return CheckResult("before", "NOT_RUN", display,
+                               note=f"could not check out the base: {added.stderr.strip()[:200]}")
+        cwd = tree / prefix if prefix else tree
+        for rel in carry:
+            src = repo / rel
+            if src.is_file():
+                (cwd / rel).parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(str(src), str(cwd / rel))
+        for rel in links:
+            src, dst = repo / rel, cwd / rel
+            if src.is_dir() and not dst.exists():
+                try:
+                    _link_dir(src, dst)
+                    made.append(dst)
+                except OSError:
+                    pass
+        return run_check("before", argv, cwd, timeout)
+    finally:
+        for link in made:
+            clean = _unlink_dir(link) and clean
+        if clean:  # never delete a tree that may still link into the project
+            _git(repo, "worktree", "remove", "--force", str(tree))
+            shutil.rmtree(str(tmp), ignore_errors=True)
+            _git(repo, "worktree", "prune")
+
+
+def _before_part(result: CheckResult, base: str) -> list:
+    where = f"the code before the change ({base[:12]})"
+    if result.status == "NOT_RUN":
+        return ["UNVERIFIED", f"could not run on {where}: {result.note}"]
+    if result.status == "TIMEOUT":
+        return ["UNVERIFIED", f"timed out on {where}"]
+    if result.status == "PASS":
+        return ["NOT_SUPPORTED", f"also passes on {where}, so it does not show the change made the difference"]
+    if result.exit_code in (127, 9009) or ENV_FAILURE_RE.search(result.output_tail):
+        return ["UNVERIFIED", f"failed on {where} for an environment reason, not the code (exit {result.exit_code})"]
+    if "pytest" in result.command and result.exit_code in (4, 5):
+        return ["UNVERIFIED", f"found no tests to run on {where} (exit {result.exit_code})"]
+    return ["SUPPORTED", f"fails on {where} (exit {result.exit_code}) and passes now"]
+
+
+def evaluate_criterion(criterion: dict, repo: Path, base_sha, carry: list,
+                       links: list, timeout: int) -> CriterionResult:
+    parts: list = []
+    tail = ""
+    if "command" not in criterion:
+        parts.append(["UNVERIFIED", "no command: nothing proves this criterion"])
+    else:
+        argv = _to_argv(criterion["command"])
+        now = run_check("criterion", argv, repo, timeout)
+        parts.append(_command_part(now, "criterion command"))
+        if now.status != "PASS":
+            tail = now.output_tail
+        if criterion.get("fails_before"):
+            if now.status != "PASS":
+                parts.append(["UNVERIFIED", "fails_before not checked because the command fails now"])
+            elif not base_sha:
+                parts.append(["UNVERIFIED", "fails_before not checked: no base commit to compare against"])
+            else:
+                files = [_norm(f) for f in criterion.get("tests", carry)]
+                before = run_fails_before(repo, base_sha, argv, files, links, timeout)
+                parts.append(_before_part(before, base_sha))
+                if parts[-1][0] != "SUPPORTED" and before.output_tail:
+                    tail = before.output_tail
+    verdicts = {p[0] for p in parts}
+    verdict = ("NOT_SUPPORTED" if "NOT_SUPPORTED" in verdicts
+               else "UNVERIFIED" if "UNVERIFIED" in verdicts else "SUPPORTED")
+    return CriterionResult(criterion["id"], criterion["text"], verdict, parts, tail)
+
+
+def check_contract(contract: dict, repo: Path, diff: DiffInfo, base: str, timeout: int,
+                   config: dict) -> dict:
+    """Evaluate a contract. Returns a dict the report, JSON and log all use."""
+    patterns = config.get("test_patterns") or prove_contract.DEFAULT_TEST_PATTERNS
+    links = config.get("before_links") or list(DEFAULT_BEFORE_LINKS)
+    out_of_scope = []
+    if diff.available:
+        out_of_scope = sorted(p for p in diff.files if not prove_contract.in_scope(p, contract))
+    carry = sorted(p for p, s in diff.files.items()
+                   if s != "D" and prove_contract.is_test_file(p, patterns))
+    base_sha = rev_sha(repo, base)
+    criteria = [evaluate_criterion(c, repo, base_sha, carry, links, timeout)
+                for c in contract["criteria"]]
+    allowed = {a["file"]: a["reason"] for a in contract["allow_test_changes"]}
+    weakened, excused = [], []
+    if diff.available:
+        for path, problem in prove_contract.test_integrity(diff.files, diff.added, diff.removed, patterns):
+            if path in allowed:
+                excused.append(f"{path}: {problem} (allowed: {allowed[path]})")
+            else:
+                weakened.append(f"{path}: {problem}")
+    return {
+        "task": contract["task"],
+        "hash": prove_contract.contract_hash(contract),
+        "scope": prove_contract.scope_patterns(contract),
+        "amendments": contract["amendments"],
+        "out_of_scope": out_of_scope,
+        "criteria": criteria,
+        "tests_weakened": weakened,
+        "tests_weakened_allowed": excused,
+    }
+
+
+def integrity_without_contract(diff: DiffInfo, config: dict) -> list:
+    patterns = config.get("test_patterns") or prove_contract.DEFAULT_TEST_PATTERNS
+    if not diff.available:
+        return []
+    return [f"{path}: {problem}" for path, problem in
+            prove_contract.test_integrity(diff.files, diff.added, diff.removed, patterns)]
+
+
+# --------------------------------------------------------------------------
 # Report
 # --------------------------------------------------------------------------
 
 
-def summarize(checks: list, claim_results: list, diff: DiffInfo, claims: list, strict: bool):
+def summarize(checks: list, claim_results: list, diff: DiffInfo, claims: list, strict: bool,
+              contract: dict | None = None, weakened: list = ()):
     gaps: list = []
     for check in checks:
         if check.status in ("NOT_RUN", "NOT_CONFIGURED"):
@@ -574,7 +763,7 @@ def summarize(checks: list, claim_results: list, diff: DiffInfo, claims: list, s
             gaps.append(f"claim not verified: {result.claim} ({'; '.join(reasons)})")
 
     unclaimed: list = []
-    if claims and diff.available:
+    if claims and diff.available and contract is None:  # with a contract, scope covers this
         claimed = {_norm(f) for c in claims for f in c.get("files", [])}
         unclaimed = sorted(path for path in diff.files if path not in claimed)
 
@@ -585,6 +774,18 @@ def summarize(checks: list, claim_results: list, diff: DiffInfo, claims: list, s
     for result in claim_results:
         if result.verdict == "NOT_SUPPORTED":
             failures.append(f"claim not supported: {result.claim}")
+    if contract is not None:
+        if contract["out_of_scope"]:
+            failures.append("changed outside the contract's scope: " + ", ".join(contract["out_of_scope"]))
+        for result in contract["criteria"]:
+            reasons = "; ".join(text for verdict, text in result.details if verdict != "SUPPORTED")
+            if result.verdict == "NOT_SUPPORTED":
+                failures.append(f"criterion not met: {result.id} {result.text} ({reasons})")
+            elif result.verdict == "UNVERIFIED":
+                gaps.append(f"criterion not verified: {result.id} {result.text} ({reasons})")
+        weakened = list(contract["tests_weakened"])
+        gaps.extend(f"test change allowed by contract: {item}" for item in contract["tests_weakened_allowed"])
+    failures.extend(f"test weakened: {item}" for item in weakened)
     if strict:
         failures.extend(f"strict: {gap}" for gap in gaps)
 
@@ -593,12 +794,30 @@ def summarize(checks: list, claim_results: list, diff: DiffInfo, claims: list, s
 
 
 def render_report(repo: Path, diff: DiffInfo, checks: list, claim_results: list,
-                  state: str, failures: list, gaps: list, unclaimed: list) -> str:
+                  state: str, failures: list, gaps: list, unclaimed: list,
+                  contract: dict | None = None) -> str:
     out = ["PROVE IT REPORT", f"repo: {repo}"]
     if diff.available:
         out.append(f"diff: {len(diff.files)} file(s) changed vs {diff.base}")
     else:
         out.append(f"diff: unavailable ({diff.note})")
+
+    if contract is not None:
+        out += ["", "CONTRACT", f"task: {contract['task']}"]
+        if contract["out_of_scope"]:
+            out.append("[OUT OF SCOPE] " + ", ".join(contract["out_of_scope"]))
+        else:
+            out.append("[IN SCOPE] every changed file is within the contract's scope")
+        for amendment in contract["amendments"]:
+            out.append(f"    amended scope: {', '.join(amendment['scope'])} (reason: {amendment['reason']})")
+        if contract["tests_weakened"]:
+            out.extend(f"[TEST WEAKENED] {item}" for item in contract["tests_weakened"])
+        out += ["", "CRITERIA"]
+        for result in contract["criteria"]:
+            out.append(f"[{result.verdict.replace('_', ' ')}] {result.id}: {result.text}")
+            for verdict, text in result.details:
+                out.append(f"    - {verdict.replace('_', ' ').lower()}: {text}")
+            out.extend(f"    | {line}" for line in result.output_tail.splitlines())
 
     out += ["", "CHECKS"]
     if not checks:
@@ -711,6 +930,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--repo", default=".", help="project folder (default: current directory)")
     parser.add_argument("--claims", help="JSON file with the claims, or '-' to read stdin")
+    parser.add_argument("--contract", help=f"contract to check (default: {prove_contract.CONTRACT_FILE} if it exists)")
     parser.add_argument("--base", default="HEAD", help="git commit to diff against (default: HEAD)")
     parser.add_argument("--checks", default=",".join(ALL_CHECKS), help="comma list of: test,build,lint")
     parser.add_argument("--timeout", type=int, default=600, help="seconds allowed per check (default: 600)")
@@ -738,12 +958,23 @@ def _run(args: argparse.Namespace) -> int:
 
     claims = load_claims(args.claims) if args.claims else []
     commands, disabled = detect_commands(repo)
+    config = load_config(repo)
+    contract_path = Path(args.contract) if args.contract else repo / prove_contract.CONTRACT_FILE
+    if args.contract and not contract_path.is_file():
+        raise UsageError(f"contract not found: {args.contract}")
+    try:
+        contract = prove_contract.load_contract(contract_path)
+    except prove_contract.ContractError as exc:
+        raise UsageError(f"bad contract: {exc}")
     ignore = set()
-    if args.claims and args.claims != "-":
+    for path in (args.claims if args.claims and args.claims != "-" else None,
+                 str(contract_path) if contract else None):
+        if not path:
+            continue
         try:
-            ignore.add(_norm(str(Path(args.claims).resolve().relative_to(repo))))
+            ignore.add(_norm(str(Path(path).resolve().relative_to(repo))))
         except ValueError:
-            pass  # claims file is outside the repo
+            pass  # file is outside the repo
     # Diff before running checks, so files the checks create are not counted.
     diff = collect_diff(repo, args.base, frozenset(ignore))
 
@@ -765,7 +996,15 @@ def _run(args: argparse.Namespace) -> int:
         if "command" in claim:
             command_result = run_check("claim", _to_argv(claim["command"]), repo, args.timeout)
         claim_results.append(evaluate_claim(claim, by_kind, diff, command_result))
-    state, failures, gaps, unclaimed = summarize(checks, claim_results, diff, claims, args.strict)
+    contract_result = None
+    weakened: list = []
+    if contract is not None:
+        contract_result = check_contract(contract, repo, diff, args.base, args.timeout, config)
+    else:
+        weakened = integrity_without_contract(diff, config)
+    state, failures, gaps, unclaimed = summarize(
+        checks, claim_results, diff, claims, args.strict, contract_result, weakened
+    )
 
     if args.json:
         payload = {
@@ -775,13 +1014,18 @@ def _run(args: argparse.Namespace) -> int:
             "diff": {"available": diff.available, "note": diff.note, "files": diff.files},
             "checks": [asdict(check) for check in checks],
             "claims": [asdict(result) for result in claim_results],
+            "contract": None if contract_result is None else {
+                **contract_result,
+                "criteria": [asdict(c) for c in contract_result["criteria"]],
+            },
             "not_verified": gaps,
             "changed_but_not_claimed": unclaimed,
             "failures": failures,
         }
         print(json.dumps(payload, indent=2))
     else:
-        print(render_report(repo, diff, checks, claim_results, state, failures, gaps, unclaimed))
+        print(render_report(repo, diff, checks, claim_results, state, failures, gaps, unclaimed,
+                            contract_result))
 
     if not args.no_log:
         # Snapshot after the checks, so files they generate do not make the
@@ -795,6 +1039,10 @@ def _run(args: argparse.Namespace) -> int:
             base_sha=rev_sha(repo, args.base),
             ignore=sorted(ignore),
             unclaimed=unclaimed,
+            contract_hash=contract_result["hash"] if contract_result else None,
+            criteria=[{"id": c.id, "verdict": c.verdict} for c in contract_result["criteria"]]
+            if contract_result else [],
+            out_of_scope=contract_result["out_of_scope"] if contract_result else [],
         )
     return 1 if state == "FAILED" else 0
 

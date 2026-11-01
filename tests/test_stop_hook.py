@@ -241,9 +241,11 @@ class StopHookTests(unittest.TestCase):
         out = self.main_with({"cwd": str(self.repo), "session_id": "m", "last_assistant_message": "Fixed."})
         self.assertEqual(json.loads(out)["decision"], "block")
 
-    def test_main_user_prompt_submit_records_head_and_prints_nothing(self):
+    def test_main_user_prompt_submit_records_head_and_adds_context(self):
         out = self.main_with({"hook_event_name": "UserPromptSubmit", "cwd": str(self.repo), "session_id": "u"})
-        self.assertEqual(out, "")
+        payload = json.loads(out)["hookSpecificOutput"]
+        self.assertEqual(payload["hookEventName"], "UserPromptSubmit")
+        self.assertIn("contract.json", payload["additionalContext"])
         state = json.loads((self.repo / ".prove-it" / "hook_state.json").read_text())
         self.assertEqual(state["turn_start"]["u"], prove_it.rev_sha(self.repo, "HEAD"))
 
