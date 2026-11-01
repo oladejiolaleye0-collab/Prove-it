@@ -7,6 +7,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 import prove_it  # noqa: E402
@@ -120,6 +121,31 @@ class CheckTests(Base):
         self.assertNotIn("lint", commands)
         self.assertIn("lint", disabled)
 
+    def test_string_command_quotes_are_stripped_on_windows(self):
+        argv = prove_it._to_argv('pytest -k "a b" C:\\proj\\tests', windows=True)
+        self.assertEqual(argv, ["pytest", "-k", "a b", "C:\\proj\\tests"])
+
+    def test_string_command_uses_posix_rules_elsewhere(self):
+        self.assertEqual(prove_it._to_argv('pytest -k "a b"', windows=False), ["pytest", "-k", "a b"])
+
+    def test_windows_store_python_alias_is_replaced(self):
+        alias = "C:\\Users\\me\\AppData\\Local\\Microsoft\\WindowsApps\\python3.exe"
+        with mock.patch("prove_it.shutil.which", return_value=alias):
+            self.assertEqual(prove_it._find_exe("python3", windows=True), sys.executable)
+        with mock.patch("prove_it.shutil.which", return_value=None):
+            self.assertEqual(prove_it._find_exe("python", windows=True), sys.executable)
+            self.assertIsNone(prove_it._find_exe("python", windows=False))
+        real = "C:\\Python312\\python.exe"
+        with mock.patch("prove_it.shutil.which", return_value=real):
+            self.assertEqual(prove_it._find_exe("python", windows=True), real)
+
+    def test_python3_check_runs_even_without_python3_on_path(self):
+        self.config(test="python3 -c \"print('hi there')\"")
+        with mock.patch("prove_it._find_exe", return_value=sys.executable):
+            code, data = run_json("--repo", str(self.repo), "--checks", "test", "--no-log")
+        self.assertEqual(data["checks"][0]["status"], "PASS")
+        self.assertIn("hi there", data["checks"][0]["output_tail"])
+
     def test_bad_config_is_a_usage_error(self):
         self.write(".prove-it.json", "{not json")
         self.assertEqual(run_main("--repo", str(self.repo), "--no-log")[0], 2)
@@ -188,6 +214,12 @@ class ClaimTests(Base):
     def test_tests_pass_claim_without_a_test_command_is_unverified(self):
         code, data = self.verdicts([{"claim": "tests pass", "kind": "tests_pass"}])
         self.assertEqual(data["claims"][0]["verdict"], "UNVERIFIED")
+
+    def test_unknown_kind_is_unverified_not_ignored(self):
+        self.write("app.py", "def old():\n    return 2\n")
+        code, data = self.verdicts([{"claim": "changed app, tests pass", "files": ["app.py"], "kind": "test_pass"}])
+        self.assertEqual(data["claims"][0]["verdict"], "UNVERIFIED")
+        self.assertTrue(any("unknown kind 'test_pass'" in gap for gap in data["not_verified"]))
 
     def test_claim_with_nothing_checkable_is_unverified(self):
         code, data = self.verdicts([{"claim": "it works great"}])
@@ -270,7 +302,7 @@ class LogTests(Base):
         self.init_git()
         self.config()
         self.write("app.py", "def old():\n    return 2\n")
-        claims = self.claims([{"claim": "changed app", "files": ["app.py"], "kind": "fixed"}])
+        claims = self.claims([{"claim": "changed app", "files": ["app.py"]}])
         run_main("--repo", str(self.repo), "--claims", claims)
         run_main("--repo", str(self.repo), "--claims", claims)
         log = (self.repo / ".prove-it" / "log.jsonl").read_text().splitlines()

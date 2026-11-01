@@ -34,6 +34,7 @@ you have reported its result. Unverified "done" claims are the failure this skil
    python3 <skill folder>/scripts/prove_it.py --claims .prove-it/claims.json
    ```
 
+   On Windows, use `python` instead of `python3`.
    Use `--base <branch>` if your work is already committed (for example `--base main`).
    Use `--strict` if the user wants unverified items treated as failures.
 

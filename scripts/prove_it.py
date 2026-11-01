@@ -92,12 +92,36 @@ def _read_text(path: Path) -> str:
         return ""
 
 
-def _to_argv(value):
+def _to_argv(value, windows: bool | None = None):
+    if windows is None:
+        windows = os.name == "nt"
     if isinstance(value, list) and value and all(isinstance(v, str) for v in value):
         return list(value)
     if isinstance(value, str) and value.strip():
-        return shlex.split(value, posix=(os.name != "nt"))
+        if not windows:
+            return shlex.split(value)
+        # Non-POSIX mode keeps backslashes in Windows paths, but also keeps
+        # the quotes around each token, so strip those.
+        argv = []
+        for token in shlex.split(value, posix=False):
+            if len(token) >= 2 and token[0] == token[-1] and token[0] in "\"'":
+                token = token[1:-1]
+            argv.append(token)
+        return argv
     return None
+
+
+def _find_exe(name: str, windows: bool | None = None):
+    """Locate a command. On Windows, 'python' and 'python3' often resolve to a
+    Microsoft Store placeholder that only prints an install hint, so use the
+    Python running this script instead."""
+    if windows is None:
+        windows = os.name == "nt"
+    exe = shutil.which(name)
+    if windows and name.lower() in ("python", "python3", "python.exe", "python3.exe"):
+        if exe is None or "windowsapps" in exe.replace("/", "\\").lower():
+            return sys.executable
+    return exe
 
 
 def _detect_node(repo: Path) -> dict:
@@ -217,9 +241,11 @@ def _tail(text: str, count: int) -> str:
 
 def run_check(kind: str, argv: list, repo: Path, timeout: int) -> CheckResult:
     display = shlex.join(argv)
-    exe = shutil.which(argv[0])
+    exe = _find_exe(argv[0])
     if exe is None:
         return CheckResult(kind, "NOT_RUN", display, note=f"command not found: {argv[0]}")
+    if exe == sys.executable and shutil.which(argv[0]) != exe:
+        display = shlex.join([exe] + argv[1:])  # report the Python actually used
     start = time.monotonic()
     try:
         proc = subprocess.run(
@@ -459,6 +485,9 @@ def evaluate_claim(claim: dict, checks: dict, diff: DiffInfo) -> ClaimResult:
         else:
             detail = f"exit {result.exit_code}" if result.exit_code is not None else result.status.lower()
             parts.append(["NOT_SUPPORTED", f"{result.command} did not pass ({detail})"])
+    elif kind:
+        known = ", ".join(CHECK_KINDS)
+        parts.append(["UNVERIFIED", f"unknown kind '{kind}' was not checked (use one of: {known})"])
 
     for path in files:
         if not diff.available:

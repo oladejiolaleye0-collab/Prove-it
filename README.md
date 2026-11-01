@@ -47,6 +47,8 @@ RESULT: FAILED
 
 Requires Python 3.8+ and git. No other dependencies.
 
+On Windows, type `python` wherever this README says `python3`. Checks in `.prove-it.json` that start with `python` or `python3` run with the same Python that runs Prove it when the command on PATH is missing or is the Microsoft Store placeholder, so one config works on every OS. The report shows which Python was used.
+
 **Claude Code**
 
 ```bash
@@ -125,7 +127,7 @@ python3 scripts/prove_it.py --claims claims.json
 | `claim` | What the agent says (required) | Shown in the report |
 | `files` | Files the agent says it changed | Present in the git diff, including new untracked files |
 | `symbols` | Names the agent says it added or changed | Whole-word match in lines added by the diff |
-| `kind` | `tests_pass`, `build_ok` or `lint_ok` | The matching command exited 0 |
+| `kind` | `tests_pass`, `build_ok` or `lint_ok` | The matching command exited 0. Any other value is reported as unverified |
 
 A claim is **SUPPORTED** only if every part is supported, **NOT SUPPORTED** if any part is contradicted, and **UNVERIFIED** otherwise.
 
