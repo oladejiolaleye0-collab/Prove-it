@@ -1,0 +1,15 @@
+name: Idea or new ecosystem
+description: Suggest a check, a language or tool to support, or a better message
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What goes wrong today
+      description: The agent behavior Prove it misses or handles badly.
+    validations:
+      required: true
+  - type: textarea
+    id: idea
+    attributes:
+      label: What you would like Prove it to do

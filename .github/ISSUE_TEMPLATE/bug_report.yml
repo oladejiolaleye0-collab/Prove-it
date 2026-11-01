@@ -1,0 +1,31 @@
+name: Bug or wrong verdict
+description: Prove it blocked good work, let bad work through, or crashed
+labels: [bug]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What the agent did, what Prove it said, and what you expected instead.
+    validations:
+      required: true
+  - type: textarea
+    id: report
+    attributes:
+      label: Prove it report or hook message
+      description: Paste the output of prove_it.py or the hook message. Remove anything private.
+      render: text
+  - type: textarea
+    id: contract
+    attributes:
+      label: Contract
+      description: The contents of .prove-it/contract.json, if there was one.
+      render: json
+  - type: input
+    id: setup
+    attributes:
+      label: Setup
+      description: OS, Python version, Claude Code version, plugin or install.py
+      placeholder: Windows 11, Python 3.12, Claude Code 2.1.308, plugin
+    validations:
+      required: true

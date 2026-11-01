@@ -1,0 +1,15 @@
+{
+  "name": "prove-it",
+  "description": "Prove it: verified, on-course coding agents",
+  "owner": {
+    "name": "oladejiolaleye0-collab",
+    "url": "https://github.com/oladejiolaleye0-collab"
+  },
+  "plugins": [
+    {
+      "name": "prove-it",
+      "source": "./",
+      "description": "Makes coding agents commit to a contract, stay in scope, and prove their work: tests that fail before the change and pass after, no weakened tests, no unverified 'done'."
+    }
+  ]
+}

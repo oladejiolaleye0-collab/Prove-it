@@ -1,0 +1,22 @@
+{
+  "name": "prove-it",
+  "displayName": "Prove it",
+  "version": "2.0.0",
+  "description": "Makes coding agents commit to a contract, stay in scope, and prove their work: tests that fail before the change and pass after, no weakened tests, no unverified 'done'.",
+  "author": {
+    "name": "oladejiolaleye0-collab",
+    "url": "https://github.com/oladejiolaleye0-collab"
+  },
+  "homepage": "https://github.com/oladejiolaleye0-collab/Prove-it",
+  "repository": "https://github.com/oladejiolaleye0-collab/Prove-it",
+  "license": "MIT",
+  "keywords": [
+    "verification",
+    "testing",
+    "guardrails",
+    "hooks",
+    "agent-safety",
+    "tdd",
+    "code-review"
+  ]
+}

@@ -28,6 +28,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import prove_contract  # noqa: E402
 
+__version__ = "2.0.0"
 TAIL_LINES = 30
 PASS_TAIL_LINES = 3
 MAX_UNTRACKED_BYTES = 1_000_000
@@ -933,6 +934,7 @@ def build_parser() -> argparse.ArgumentParser:
         prog="prove_it",
         description="Run real checks and match an agent's claims against the git diff.",
     )
+    parser.add_argument("--version", action="version", version=f"prove-it {__version__}")
     parser.add_argument("--repo", default=".", help="project folder (default: current directory)")
     parser.add_argument("--claims", help="JSON file with the claims, or '-' to read stdin")
     parser.add_argument("--contract", help=f"contract to check (default: {prove_contract.CONTRACT_FILE} if it exists)")
